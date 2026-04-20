@@ -50,6 +50,8 @@ const state = {
   selectedLobbyId: "lobby-1",
   tradeDrafts: {},
   interactionLock: false,
+  seenNotificationIds: {},
+  notificationQueue: [],
   pageMode: pageParams.get("mode") === "admin" ? "admin" : "default",
 };
 
@@ -59,7 +61,15 @@ async function api(path, options = {}) {
     headers: { "Content-Type": "application/json" },
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
-  const payload = await response.json();
+  const text = await response.text();
+  let payload = {};
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch (error) {
+      throw new Error(text);
+    }
+  }
   if (!response.ok) {
     throw new Error(payload.error || "Request failed.");
   }
@@ -136,7 +146,9 @@ async function refreshBootstrap() {
 
 async function refreshView() {
   if (!state.session) return;
-  state.view = await api(`/api/state?token=${encodeURIComponent(state.session.token)}`);
+  const nextView = await api(`/api/state?token=${encodeURIComponent(state.session.token)}`);
+  queueNotifications(nextView);
+  state.view = nextView;
 }
 
 async function poll() {
@@ -152,7 +164,7 @@ async function poll() {
       clearSession();
     }
   }
-  if (!state.interactionLock) {
+  if (!shouldDeferRender()) {
     render();
   }
 }
@@ -605,6 +617,56 @@ function renderModal() {
   `;
 }
 
+function queueNotifications(view) {
+  if (!view || view.role !== "team" || !Array.isArray(view.notifications)) {
+    return;
+  }
+  for (const notification of view.notifications) {
+    if (state.seenNotificationIds[notification.id]) {
+      continue;
+    }
+    state.seenNotificationIds[notification.id] = true;
+    state.notificationQueue.push(notification.message);
+  }
+  if (!state.actionMessage && !state.error && state.notificationQueue.length) {
+    state.actionMessage = state.notificationQueue.shift();
+  }
+}
+
+function captureFocusedInputState() {
+  const active = document.activeElement;
+  if (!active || !active.id) {
+    return null;
+  }
+  const tag = active.tagName;
+  if (tag !== "INPUT" && tag !== "TEXTAREA") {
+    return null;
+  }
+  return {
+    id: active.id,
+    selectionStart: active.selectionStart,
+    selectionEnd: active.selectionEnd,
+  };
+}
+
+function restoreFocusedInputState(snapshot) {
+  if (!snapshot) {
+    return;
+  }
+  const next = document.getElementById(snapshot.id);
+  if (!next) {
+    return;
+  }
+  next.focus();
+  if (typeof snapshot.selectionStart === "number" && typeof snapshot.selectionEnd === "number") {
+    next.setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd);
+  }
+}
+
+function shouldDeferRender() {
+  return document.activeElement?.tagName === "SELECT";
+}
+
 function renderTradeForm(team, targetId) {
   const draft = getTradeDraft(team.id, targetId);
   return `
@@ -687,23 +749,29 @@ function renderEuropeTrade(trade) {
 }
 
 function render() {
+  const focusSnapshot = captureFocusedInputState();
   if (!state.bootstrap) {
     app.innerHTML = `<div class="shell"><div class="panel">Loading…</div></div>`;
+    restoreFocusedInputState(focusSnapshot);
     return;
   }
   if (!state.session || !state.view) {
     renderLanding();
+    restoreFocusedInputState(focusSnapshot);
     return;
   }
   if (state.view.role === "host") {
     if (state.pageMode === "admin") {
       renderAdmin();
+      restoreFocusedInputState(focusSnapshot);
       return;
     }
     renderHost();
+    restoreFocusedInputState(focusSnapshot);
     return;
   }
   renderTeam();
+  restoreFocusedInputState(focusSnapshot);
 }
 
 function getTradeDraft(teamId, targetId) {
@@ -915,7 +983,9 @@ function openProjectorView() {
 }
 
 function closeModal() {
-  state.actionMessage = "";
+  if (state.actionMessage) {
+    state.actionMessage = state.notificationQueue.shift() || "";
+  }
   state.error = "";
   render();
 }
@@ -928,22 +998,23 @@ document.addEventListener("change", (event) => {
 
 document.addEventListener("focusin", (event) => {
   const tag = event.target.tagName;
-  if (tag === "SELECT" || tag === "INPUT" || tag === "TEXTAREA") {
+  if (tag === "SELECT") {
     state.interactionLock = true;
   }
 });
 
 document.addEventListener("focusout", () => {
   setTimeout(() => {
-    const activeTag = document.activeElement?.tagName;
-    state.interactionLock =
-      activeTag === "SELECT" || activeTag === "INPUT" || activeTag === "TEXTAREA";
+    state.interactionLock = document.activeElement?.tagName === "SELECT";
+    if (!shouldDeferRender()) {
+      render();
+    }
   }, 0);
 });
 
 setInterval(() => {
   if (
-    !state.interactionLock &&
+    !shouldDeferRender() &&
     state.view &&
     state.view.lobby &&
     state.view.lobby.roundEndsAt

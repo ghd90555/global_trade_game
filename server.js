@@ -68,7 +68,7 @@ const DEFAULT_TEAMS = {
     inventory: {
       ivory: 5,
       silver: 0,
-      porcelain: 10,
+      porcelain: 0,
       cowrie: 20,
       nutmeg: 10,
     },
@@ -119,6 +119,9 @@ function clone(value) {
 }
 
 function createLobby(id) {
+  const teamNotifications = Object.fromEntries(
+    Object.keys(DEFAULT_TEAMS).map((teamId) => [teamId, []])
+  );
   return {
     id,
     name: LOBBY_NAMES[id],
@@ -138,6 +141,8 @@ function createLobby(id) {
     },
     trades: [],
     nextTradeId: 1,
+    notifications: teamNotifications,
+    nextNotificationId: 1,
     europeBlockUsedInRound: false,
     resultsShown: false,
     finalResults: null,
@@ -254,9 +259,9 @@ function currentEventForRound(round) {
   if (round === 3) {
     return {
       round,
-      title: "Dutch East India Company Founded",
+      title: "VOC Monopoly",
       description:
-        "Europe forces Southeast Asia to sell their Nutmeg. Southeast Asia's nutmeg value drops to 0. Every accepted trade must be approved or rejected by Europe in this round.",
+        "Europe forces Southeast Asia to sell their Nutmeg. Southeast Asia's nutmeg value drops to 0. Southeast Asia can only trade Nutmeg with Europe. Every accepted trade must be approved or rejected by Europe in this round.",
     };
   }
   return {
@@ -330,6 +335,7 @@ function getTeamView(lobby, nationId) {
     pendingIncoming,
     pendingOutgoing,
     approvalQueue,
+    notifications: lobby.notifications[nationId] || [],
     recentTrades: lobby.trades.slice(-10).map(publicTrade),
     gameResult: lobby.resultsShown ? lobby.finalResults : null,
   };
@@ -413,6 +419,26 @@ function startRound(lobby) {
     lobby.teams.europe.inventory.nutmeg += 2;
     lobby.teams.southeastAsia.inventory.nutmeg += 4;
     lobby.teams.westAfrica.inventory.ivory += 3;
+    pushNotification(
+      lobby,
+      "china",
+      `Round ${lobby.round} start: China received +3 Porcelain.`
+    );
+    pushNotification(
+      lobby,
+      "europe",
+      `Round ${lobby.round} start: Europe received +20 Cowrie, +2 Ivory, +2 Silver, +2 Porcelain, and +2 Nutmeg.`
+    );
+    pushNotification(
+      lobby,
+      "southeastAsia",
+      `Round ${lobby.round} start: Southeast Asia received +4 Nutmeg.`
+    );
+    pushNotification(
+      lobby,
+      "westAfrica",
+      `Round ${lobby.round} start: West Africa received +3 Ivory.`
+    );
   }
   lobby.state = "round-active";
   lobby.roundEndsAt = Date.now() + lobby.roundDurationSeconds * 1000;
@@ -425,10 +451,46 @@ function finishRound(lobby) {
   if (lobby.state !== "round-active") {
     return;
   }
+  if (lobby.round === 3) {
+    transferRemainingNutmegToEurope(lobby);
+  }
   lobby.state = lobby.round >= lobby.totalRounds ? "awaiting-results" : "between-rounds";
   lobby.roundEndsAt = null;
   resolveExpiredPendingTrades(lobby);
   markUpdated(lobby);
+}
+
+function pushNotification(lobby, nationId, message) {
+  if (!lobby.notifications[nationId]) {
+    return;
+  }
+  lobby.notifications[nationId].push({
+    id: `${lobby.nextNotificationId++}`,
+    message,
+    createdAt: Date.now(),
+  });
+  lobby.notifications[nationId] = lobby.notifications[nationId].slice(-20);
+}
+
+function transferRemainingNutmegToEurope(lobby) {
+  const southeastAsia = lobby.teams.southeastAsia;
+  const europe = lobby.teams.europe;
+  if (!southeastAsia || !europe || southeastAsia.inventory.nutmeg <= 0) {
+    return;
+  }
+  const transferredNutmeg = southeastAsia.inventory.nutmeg;
+  southeastAsia.inventory.nutmeg = 0;
+  europe.inventory.nutmeg += transferredNutmeg;
+  pushNotification(
+    lobby,
+    "southeastAsia",
+    `VOC Monopoly: Europe seized your remaining ${transferredNutmeg} nutmeg at the end of the round.`
+  );
+  pushNotification(
+    lobby,
+    "europe",
+    `VOC Monopoly: Europe received ${transferredNutmeg} nutmeg from Southeast Asia at the end of the round.`
+  );
 }
 
 function resolveExpiredPendingTrades(lobby) {
@@ -468,6 +530,23 @@ function ensureTradeHasValue(lobby, fromNationId, toNationId, offer) {
       (toNationId === "southeastAsia" && offer.to.nutmeg > 0));
   if ((fromValue < 1 || toValue < 1) && !southeastAsiaForcedSale) {
     throw new Error("Each side of a trade must include at least one resource worth 1 point or more to the region offering it.");
+  }
+}
+
+function ensureRoundThreeNutmegRule(lobby, fromNationId, toNationId, offer) {
+  if (lobby.round !== 3) {
+    return;
+  }
+  const southeastAsiaOffersNutmegToNonEurope =
+    fromNationId === "southeastAsia" &&
+    toNationId !== "europe" &&
+    offer.from.nutmeg > 0;
+  const nonEuropeRequestsNutmegFromSoutheastAsia =
+    toNationId === "southeastAsia" &&
+    fromNationId !== "europe" &&
+    offer.to.nutmeg > 0;
+  if (southeastAsiaOffersNutmegToNonEurope || nonEuropeRequestsNutmegFromSoutheastAsia) {
+    throw new Error("In round 3, Southeast Asia can only trade Nutmeg with Europe.");
   }
 }
 
@@ -517,6 +596,10 @@ function resetLobby(lobby) {
   lobby.currentEvent = currentEventForRound(0);
   lobby.trades = [];
   lobby.nextTradeId = 1;
+  lobby.notifications = Object.fromEntries(
+    Object.keys(lobby.teams).map((teamId) => [teamId, []])
+  );
+  lobby.nextNotificationId = 1;
   lobby.europeBlockUsedInRound = false;
   lobby.resultsShown = false;
   lobby.finalResults = null;
@@ -680,6 +763,7 @@ function handleApiRequest(req, res, reqUrl) {
         }
         const offer = body.offer;
         validateOfferShape(offer);
+        ensureRoundThreeNutmegRule(lobby, fromNationId, toNationId, offer);
         ensureTradeHasValue(lobby, fromNationId, toNationId, offer);
         ensureInventoryCanCover(lobby.teams[fromNationId].inventory, offer.from);
         const trade = {
@@ -719,6 +803,11 @@ function handleApiRequest(req, res, reqUrl) {
           trade.status = "rejected";
           trade.respondedAt = Date.now();
           trade.settledAt = Date.now();
+          pushNotification(
+            lobby,
+            trade.fromNationId,
+            `${labelNation(trade.toNationId)} rejected your trade offer.`
+          );
           markUpdated(lobby);
           sendJson(res, 200, { ok: true });
           return;
@@ -736,12 +825,27 @@ function handleApiRequest(req, res, reqUrl) {
           trade.toNationId !== "europe"
         ) {
           trade.status = "awaiting_europe";
+          pushNotification(
+            lobby,
+            trade.fromNationId,
+            `Your trade with ${labelNation(trade.toNationId)} is waiting for Europe to approve it.`
+          );
+          pushNotification(
+            lobby,
+            trade.toNationId,
+            `Europe must approve the trade with ${labelNation(trade.fromNationId)} before it can go through.`
+          );
           markUpdated(lobby);
           sendJson(res, 200, { ok: true, awaitingEurope: true });
           return;
         }
 
         applyTrade(lobby, trade);
+        pushNotification(
+          lobby,
+          trade.fromNationId,
+          `${labelNation(trade.toNationId)} accepted your trade offer.`
+        );
         sendJson(res, 200, { ok: true });
       })
       .catch((error) => sendJson(res, 400, { error: error.message }));
@@ -763,12 +867,32 @@ function handleApiRequest(req, res, reqUrl) {
         }
         if (body.decision === "approve") {
           applyTrade(lobby, trade);
+          pushNotification(
+            lobby,
+            trade.fromNationId,
+            `Europe approved the trade with ${labelNation(trade.toNationId)}.`
+          );
+          pushNotification(
+            lobby,
+            trade.toNationId,
+            `Europe approved the trade with ${labelNation(trade.fromNationId)}.`
+          );
           sendJson(res, 200, { ok: true });
           return;
         }
         if (body.decision === "block") {
           trade.status = "blocked";
           trade.settledAt = Date.now();
+          pushNotification(
+            lobby,
+            trade.fromNationId,
+            `Europe blocked the trade with ${labelNation(trade.toNationId)}.`
+          );
+          pushNotification(
+            lobby,
+            trade.toNationId,
+            `Europe blocked the trade with ${labelNation(trade.fromNationId)}.`
+          );
           markUpdated(lobby);
           sendJson(res, 200, { ok: true });
           return;
@@ -780,6 +904,15 @@ function handleApiRequest(req, res, reqUrl) {
   }
 
   sendJson(res, 404, { error: "Not found." });
+}
+
+function labelNation(nationId) {
+  return {
+    southeastAsia: "Southeast Asia",
+    china: "China",
+    westAfrica: "West Africa",
+    europe: "Europe",
+  }[nationId] || nationId;
 }
 
 function serveStatic(req, res, reqUrl) {
