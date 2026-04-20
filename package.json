@@ -1,0 +1,9 @@
+{
+  "name": "jol-history-trade-game",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local multiplayer classroom trade simulation for history classes.",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
