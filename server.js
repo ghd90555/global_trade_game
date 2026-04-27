@@ -7,6 +7,7 @@ const { URL } = require("url");
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || "127.0.0.1";
 const PUBLIC_DIR = path.join(__dirname, "public");
+const TEAM_SESSION_TTL_MS = 30 * 60 * 1000;
 
 const RESOURCE_KEYS = ["ivory", "silver", "porcelain", "cowrie", "nutmeg"];
 const TRADE_KEYS = RESOURCE_KEYS;
@@ -188,11 +189,14 @@ function readBody(req) {
 }
 
 function getSession(reqUrl) {
+  cleanupStaleSessions();
   const token = reqUrl.searchParams.get("token");
   if (!token || !sessions.has(token)) {
     return null;
   }
-  return sessions.get(token);
+  const session = sessions.get(token);
+  touchSession(session);
+  return session;
 }
 
 function getLobby(lobbyId) {
@@ -222,6 +226,7 @@ function summarizeLobby(lobby) {
 }
 
 function sessionsClaimLobbyNation(lobbyId, nationId) {
+  cleanupStaleSessions();
   for (const session of sessions.values()) {
     if (
       session.lobbyId === lobbyId &&
@@ -390,6 +395,33 @@ function calculateFinalResults(lobby) {
 function assertLobbyState(lobby, expectedState) {
   if (lobby.state !== expectedState) {
     throw new Error(`Lobby must be in ${expectedState} state.`);
+  }
+}
+
+function touchSession(session) {
+  if (!session) {
+    return;
+  }
+  session.lastSeenAt = Date.now();
+}
+
+function cleanupStaleSessions() {
+  const now = Date.now();
+  const touchedLobbies = new Set();
+  for (const [token, session] of sessions.entries()) {
+    if (session.role !== "team") {
+      continue;
+    }
+    if (now - (session.lastSeenAt || 0) <= TEAM_SESSION_TTL_MS) {
+      continue;
+    }
+    sessions.delete(token);
+    if (session.lobbyId && lobbies.has(session.lobbyId)) {
+      touchedLobbies.add(session.lobbyId);
+    }
+  }
+  for (const lobbyId of touchedLobbies) {
+    markUpdated(lobbies.get(lobbyId));
   }
 }
 
@@ -604,7 +636,7 @@ function resetLobby(lobby) {
   lobby.resultsShown = false;
   lobby.finalResults = null;
   for (const [token, session] of sessions.entries()) {
-    if (session.lobbyId === lobby.id && session.role === "team" && !lobby.teams[session.nationId]) {
+    if (session.lobbyId === lobby.id && session.role === "team") {
       sessions.delete(token);
     }
   }
@@ -612,6 +644,7 @@ function resetLobby(lobby) {
 }
 
 function handleApiRequest(req, res, reqUrl) {
+  cleanupStaleSessions();
   const pathname = reqUrl.pathname;
   if (req.method === "GET" && pathname === "/api/bootstrap") {
     sendJson(res, 200, { lobbies: Array.from(lobbies.values()).map(summarizeLobby) });
@@ -623,7 +656,12 @@ function handleApiRequest(req, res, reqUrl) {
       .then((body) => {
         const lobby = getLobby(body.lobbyId);
         const token = crypto.randomUUID();
-        sessions.set(token, { token, role: "host", lobbyId: lobby.id });
+        sessions.set(token, {
+          token,
+          role: "host",
+          lobbyId: lobby.id,
+          lastSeenAt: Date.now(),
+        });
         sendJson(res, 200, { token });
       })
       .catch((error) => sendJson(res, 400, { error: error.message }));
@@ -642,7 +680,13 @@ function handleApiRequest(req, res, reqUrl) {
           throw new Error("That region has already been claimed in this lobby.");
         }
         const token = crypto.randomUUID();
-        sessions.set(token, { token, role: "team", lobbyId: lobby.id, nationId });
+        sessions.set(token, {
+          token,
+          role: "team",
+          lobbyId: lobby.id,
+          nationId,
+          lastSeenAt: Date.now(),
+        });
         markUpdated(lobby);
         sendJson(res, 200, { token });
       })
@@ -690,6 +734,7 @@ function handleApiRequest(req, res, reqUrl) {
     readBody(req)
       .then((body) => {
         const session = sessions.get(body.token);
+        touchSession(session);
         ensureHostSession(session);
         const lobby = getLobby(session.lobbyId);
         if (body.action === "startRound") {
@@ -747,6 +792,7 @@ function handleApiRequest(req, res, reqUrl) {
     readBody(req)
       .then((body) => {
         const session = sessions.get(body.token);
+        touchSession(session);
         ensureTeamSession(session);
         const lobby = getLobby(session.lobbyId);
         assertLobbyState(lobby, "round-active");
@@ -787,6 +833,7 @@ function handleApiRequest(req, res, reqUrl) {
     readBody(req)
       .then((body) => {
         const session = sessions.get(body.token);
+        touchSession(session);
         ensureTeamSession(session);
         const lobby = getLobby(session.lobbyId);
         const trade = lobby.trades.find((entry) => entry.id === String(body.tradeId));
@@ -856,6 +903,7 @@ function handleApiRequest(req, res, reqUrl) {
     readBody(req)
       .then((body) => {
         const session = sessions.get(body.token);
+        touchSession(session);
         ensureTeamSession(session);
         if (session.nationId !== "europe") {
           throw new Error("Only Europe can approve or block these trades.");
@@ -944,6 +992,7 @@ function serveStatic(req, res, reqUrl) {
 }
 
 setInterval(() => {
+  cleanupStaleSessions();
   const now = Date.now();
   for (const lobby of lobbies.values()) {
     if (lobby.state === "round-active" && lobby.roundEndsAt && now >= lobby.roundEndsAt) {
