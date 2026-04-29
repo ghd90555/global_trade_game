@@ -52,6 +52,10 @@ const state = {
   interactionLock: false,
   seenNotificationIds: {},
   notificationQueue: [],
+  lastSuccessfulPollAt: 0,
+  consecutivePollFailures: 0,
+  lastPollError: "",
+  lastClientStatusSentAt: 0,
   pageMode: pageParams.get("mode") === "admin" ? "admin" : "default",
 };
 
@@ -157,8 +161,14 @@ async function poll() {
     if (state.session) {
       await refreshView();
     }
+    state.lastSuccessfulPollAt = Date.now();
+    state.consecutivePollFailures = 0;
+    state.lastPollError = "";
+    maybeSendClientStatus();
     state.error = "";
   } catch (error) {
+    state.consecutivePollFailures += 1;
+    state.lastPollError = error.message;
     state.error = error.message;
     if (error.message === "Session not found.") {
       clearSession();
@@ -266,6 +276,7 @@ function renderHost() {
         <h1>${lobby.name}</h1>
         <div class="actions">
           <button class="secondary" onclick="leaveSession()">Leave host view</button>
+          <button class="secondary" onclick="openAdminView()">Open Teacher Admin</button>
           <button onclick="hostAction('startRound')" ${lobby.state === "round-active" || lobby.state === "game-over" || lobby.state === "awaiting-results" ? "disabled" : ""}>
             ${lobby.round === 0 ? "Start Round 1" : lobby.round < lobby.totalRounds ? `Start Round ${lobby.round + 1}` : "All rounds complete"}
           </button>
@@ -309,7 +320,7 @@ function renderHost() {
 }
 
 function renderAdmin() {
-  const { lobby, teams, settingsDraft, trades, results } = state.view;
+  const { lobby, teams, settingsDraft, trades, results, regionStatus } = state.view;
   app.innerHTML = `
     <div class="shell stack">
       <section class="hero">
@@ -364,6 +375,14 @@ function renderAdmin() {
         </div>
       </section>
 
+      <section class="panel stack">
+        <h2>Live Region Status</h2>
+        <div class="small">Use this area if a device goes quiet during class. Release Region preserves the region's resources and score, and clears only unresolved trades involving that region.</div>
+        <div class="region-debug-list">
+          ${regionStatus.map(renderRegionStatusCard).join("")}
+        </div>
+      </section>
+
       <section class="grid-2">
         <div class="panel stack">
           <h2>Trades</h2>
@@ -382,6 +401,29 @@ function renderAdmin() {
     ${renderModal()}
   `;
   hydrateSettingsForm(settingsDraft);
+}
+
+function renderRegionStatusCard(entry) {
+  const summary = summarizeRegionStatus(entry);
+  return `
+    <div class="debug-card">
+      <div class="debug-card-top">
+        <div>
+          <strong>${entry.regionName}</strong>
+          <div class="small">${summary.note}</div>
+        </div>
+        <span class="debug-badge ${summary.levelClass}">${summary.label}</span>
+      </div>
+      <div class="debug-metrics">
+        <div><span>Claim</span><strong>${entry.claimed ? "Taken" : "Open"}</strong></div>
+        <div><span>Last heartbeat</span><strong>${formatHeartbeat(entry.clientStatus?.lastSuccessfulPollAt)}</strong></div>
+        <div><span>Polling trouble</span><strong>${formatPollHealth(entry.clientStatus)}</strong></div>
+      </div>
+      <div class="inline-actions">
+        <button class="secondary" ${entry.claimed ? "" : "disabled"} onclick="releaseRegion('${entry.regionId}')">Release Region</button>
+      </div>
+    </div>
+  `;
 }
 
 function renderSettingsForm(settingsDraft) {
@@ -615,6 +657,73 @@ function renderModal() {
       </div>
     </div>
   `;
+}
+
+function formatHeartbeat(timestamp) {
+  if (!timestamp) {
+    return "No recent signal";
+  }
+  const secondsAgo = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+  if (secondsAgo < 5) return "Just now";
+  if (secondsAgo < 60) return `${secondsAgo}s ago`;
+  const minutesAgo = Math.round(secondsAgo / 60);
+  return `${minutesAgo}m ago`;
+}
+
+function formatPollHealth(clientStatus) {
+  if (!clientStatus) {
+    return "Waiting for device";
+  }
+  if (clientStatus.consecutiveFailures > 0) {
+    return `${clientStatus.consecutiveFailures} recent issue${clientStatus.consecutiveFailures === 1 ? "" : "s"}`;
+  }
+  if (clientStatus.online === false) {
+    return "Offline on device";
+  }
+  if (clientStatus.pageHidden) {
+    return "Background tab";
+  }
+  return "No recent issues";
+}
+
+function summarizeRegionStatus(entry) {
+  const clientStatus = entry.clientStatus;
+  if (!entry.claimed) {
+    return {
+      label: "Open",
+      note: "No device is currently controlling this region.",
+      levelClass: "debug-open",
+    };
+  }
+  if (!clientStatus) {
+    return {
+      label: "Needs attention",
+      note: "This region is claimed but has not sent a recent heartbeat.",
+      levelClass: "debug-bad",
+    };
+  }
+  const ageMs = Date.now() - clientStatus.lastSuccessfulPollAt;
+  if (clientStatus.online === false || clientStatus.consecutiveFailures >= 3 || ageMs > 20000) {
+    return {
+      label: "Needs attention",
+      note: clientStatus.lastError
+        ? `Most recent issue: ${clientStatus.lastError}`
+        : "The device has gone quiet or is struggling to reconnect.",
+      levelClass: "debug-bad",
+    };
+  }
+  if (clientStatus.pageHidden || clientStatus.consecutiveFailures > 0 || ageMs > 7000) {
+    return {
+      label: "Quiet",
+      note: "The device is connected, but updates are slower or the tab may be in the background.",
+      levelClass: "debug-warn",
+    };
+  }
+  return {
+    label: "Healthy",
+    note: "The region is sending live updates normally.",
+    levelClass: "debug-good",
+  };
 }
 
 function queueNotifications(view) {
@@ -877,6 +986,23 @@ async function hostAction(action) {
   await poll();
 }
 
+async function releaseRegion(regionId) {
+  state.actionMessage = "";
+  state.error = "";
+  try {
+    await api("/api/host/action", {
+      method: "POST",
+      body: { token: state.session.token, action: "releaseRegion", regionId },
+    });
+  } catch (error) {
+    state.actionMessage = error.message;
+    render();
+    return;
+  }
+  state.actionMessage = `${labelNation(regionId)} has been released. Their resources and score were preserved, and unresolved trades involving that region were cleared.`;
+  await poll();
+}
+
 async function saveSettings() {
   state.actionMessage = "";
   state.error = "";
@@ -978,8 +1104,40 @@ async function leaveSession() {
   await poll();
 }
 
+async function maybeSendClientStatus() {
+  if (!state.session || !state.view || state.view.role !== "team") {
+    return;
+  }
+  const now = Date.now();
+  if (now - state.lastClientStatusSentAt < 5000) {
+    return;
+  }
+  state.lastClientStatusSentAt = now;
+  try {
+    await api("/api/client-status", {
+      method: "POST",
+      body: {
+        token: state.session.token,
+        status: {
+          lastSuccessfulPollAt: state.lastSuccessfulPollAt,
+          consecutiveFailures: state.consecutivePollFailures,
+          lastError: state.lastPollError,
+          online: navigator.onLine,
+          pageHidden: document.hidden,
+        },
+      },
+    });
+  } catch (error) {
+    console.error(error);
+  }
+}
+
 function openProjectorView() {
   window.location.href = `${window.location.origin}?token=${encodeURIComponent(state.session.token)}`;
+}
+
+function openAdminView() {
+  window.location.href = `${window.location.origin}?mode=admin&token=${encodeURIComponent(state.session.token)}`;
 }
 
 function closeModal() {

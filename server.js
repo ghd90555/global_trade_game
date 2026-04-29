@@ -123,6 +123,9 @@ function createLobby(id) {
   const teamNotifications = Object.fromEntries(
     Object.keys(DEFAULT_TEAMS).map((teamId) => [teamId, []])
   );
+  const clientStatus = Object.fromEntries(
+    Object.keys(DEFAULT_TEAMS).map((teamId) => [teamId, null])
+  );
   return {
     id,
     name: LOBBY_NAMES[id],
@@ -143,6 +146,7 @@ function createLobby(id) {
     trades: [],
     nextTradeId: 1,
     notifications: teamNotifications,
+    clientStatus,
     nextNotificationId: 1,
     europeBlockUsedInRound: false,
     resultsShown: false,
@@ -369,6 +373,12 @@ function getHostView(lobby) {
     trades: lobby.trades.map(publicTrade),
     settingsDraft: lobby.settingsDraft,
     results: lobby.resultsShown ? lobby.finalResults : null,
+    regionStatus: Object.values(lobby.teams).map((team) => ({
+      regionId: team.id,
+      regionName: team.name,
+      claimed: sessionsClaimLobbyNation(lobby.id, team.id),
+      clientStatus: lobby.clientStatus[team.id],
+    })),
   };
 }
 
@@ -417,6 +427,7 @@ function cleanupStaleSessions() {
     }
     sessions.delete(token);
     if (session.lobbyId && lobbies.has(session.lobbyId)) {
+      lobbies.get(session.lobbyId).clientStatus[session.nationId] = null;
       touchedLobbies.add(session.lobbyId);
     }
   }
@@ -631,6 +642,9 @@ function resetLobby(lobby) {
   lobby.notifications = Object.fromEntries(
     Object.keys(lobby.teams).map((teamId) => [teamId, []])
   );
+  lobby.clientStatus = Object.fromEntries(
+    Object.keys(lobby.teams).map((teamId) => [teamId, null])
+  );
   lobby.nextNotificationId = 1;
   lobby.europeBlockUsedInRound = false;
   lobby.resultsShown = false;
@@ -640,6 +654,56 @@ function resetLobby(lobby) {
       sessions.delete(token);
     }
   }
+  markUpdated(lobby);
+}
+
+function releaseRegion(lobby, nationId) {
+  if (!lobby.teams[nationId]) {
+    throw new Error("Unknown region.");
+  }
+  for (const [token, session] of sessions.entries()) {
+    if (
+      session.lobbyId === lobby.id &&
+      session.role === "team" &&
+      session.nationId === nationId
+    ) {
+      sessions.delete(token);
+    }
+  }
+  for (const trade of lobby.trades) {
+    if (
+      ["pending", "awaiting_europe"].includes(trade.status) &&
+      (trade.fromNationId === nationId || trade.toNationId === nationId)
+    ) {
+      trade.status = "expired";
+      trade.respondedAt = Date.now();
+      trade.settledAt = Date.now();
+      const otherNationId =
+        trade.fromNationId === nationId ? trade.toNationId : trade.fromNationId;
+      pushNotification(
+        lobby,
+        otherNationId,
+        `${labelNation(nationId)} was released from its device, so the unresolved trade was cleared.`
+      );
+    }
+  }
+  lobby.clientStatus[nationId] = null;
+  markUpdated(lobby);
+}
+
+function recordClientStatus(lobby, nationId, status) {
+  if (!lobby.teams[nationId]) {
+    return;
+  }
+  const now = Date.now();
+  lobby.clientStatus[nationId] = {
+    lastSeenAt: now,
+    lastSuccessfulPollAt: Number(status.lastSuccessfulPollAt) || now,
+    consecutiveFailures: Math.max(0, Number(status.consecutiveFailures) || 0),
+    lastError: status.lastError ? String(status.lastError).slice(0, 160) : "",
+    online: status.online !== false,
+    pageHidden: Boolean(status.pageHidden),
+  };
   markUpdated(lobby);
 }
 
@@ -749,6 +813,8 @@ function handleApiRequest(req, res, reqUrl) {
           finishRound(lobby);
         } else if (body.action === "resetLobby") {
           resetLobby(lobby);
+        } else if (body.action === "releaseRegion") {
+          releaseRegion(lobby, body.regionId);
         } else if (body.action === "showResults") {
           if (lobby.state !== "awaiting-results") {
             throw new Error("Results can only be shown after round 3 ends.");
@@ -782,6 +848,20 @@ function handleApiRequest(req, res, reqUrl) {
         } else {
           throw new Error("Unknown host action.");
         }
+        sendJson(res, 200, { ok: true });
+      })
+      .catch((error) => sendJson(res, 400, { error: error.message }));
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/api/client-status") {
+    readBody(req)
+      .then((body) => {
+        const session = sessions.get(body.token);
+        touchSession(session);
+        ensureTeamSession(session);
+        const lobby = getLobby(session.lobbyId);
+        recordClientStatus(lobby, session.nationId, body.status || {});
         sendJson(res, 200, { ok: true });
       })
       .catch((error) => sendJson(res, 400, { error: error.message }));
