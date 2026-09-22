@@ -103,7 +103,7 @@ function clearSession() {
 }
 
 function formatTime(endTime) {
-  if (!endTime) return "05:00";
+  if (!endTime) return "02:30";
   const secondsLeft = Math.max(0, Math.ceil((endTime - Date.now()) / 1000));
   const minutes = String(Math.floor(secondsLeft / 60)).padStart(2, "0");
   const seconds = String(secondsLeft % 60).padStart(2, "0");

@@ -132,7 +132,7 @@ function createLobby(id) {
     state: "lobby",
     round: 0,
     totalRounds: 3,
-    roundDurationSeconds: 300,
+    roundDurationSeconds: 150,
     roundEndsAt: null,
     teams: clone(DEFAULT_TEAMS),
     currentEvent: currentEventForRound(0),
